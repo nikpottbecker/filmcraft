@@ -433,3 +433,20 @@ fn a_compound_clip_inside_itself_is_a_gap() {
     assert!(report.mentions("contains itself"), "{report}");
     imp.project.sequence(imp.sequences[0]).unwrap().check().unwrap();
 }
+
+#[test]
+fn overlapping_clips_beyond_the_track_limit_are_skipped() {
+    // 300 clips stacked at one time on a single Resolve track: each overlap moves to the next
+    // free track, until the import limit, where the rest are reported and skipped.
+    let items: String =
+        (0..300).map(|i| item("Sm2TiVideoClip", &format!("C{i:03}.mov"), "108000", "30", "0", "", &format!("/Media/C{i:03}.mov"), "", false)).collect();
+    let doc = format!(
+        r#"<Sm2SequenceContainer DbId="container"><VideoTrackVec><Element><Sm2TiTrack DbId="t"><Type>0</Type><Sequence>{SEQ}</Sequence><Items>{items}</Items></Sm2TiTrack></Element></VideoTrackVec></Sm2SequenceContainer>"#
+    );
+    let (imp, report) = import_with(doc.as_bytes(), Format::Drp, &ImportOptions::default()).unwrap();
+    let seq = imp.project.sequence(imp.sequences[0]).unwrap();
+    assert!(seq.video_tracks.len() <= crate::common::MAX_IMPORTED_TRACKS);
+    let placed: usize = seq.video_tracks.iter().map(|t| t.items.len()).sum();
+    assert!(placed < 300 && placed > 0, "{placed}");
+    assert!(report.mentions("track import limit"), "{report}");
+}
