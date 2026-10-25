@@ -44,7 +44,7 @@ use filmcraft_project::{
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use roxmltree::Node;
 
-use crate::common::{Builder, MediaSpec, file_name, kind_from_ext, rate_from_f64, resolve_path, settings_for, transition_effect};
+use crate::common::{Builder, MAX_IMPORTED_TRACKS, MediaSpec, file_name, kind_from_ext, rate_from_f64, resolve_path, settings_for, transition_effect};
 use crate::xml::{child, child_text, elements};
 use crate::{Error, Format, ImportOptions, Imported, Report, Result};
 
@@ -620,9 +620,10 @@ impl Imp<'_, '_> {
 
     /// Place a clip on its track, or on the next free one if Resolve's layout overlaps there.
     fn put(&mut self, seq: &mut Sequence, kind: TrackKind, index: usize, item: TrackItem) {
-        let placed = self.b.place(seq, kind, index, item);
-        if placed != index {
-            self.report.info("overlapping clips were moved to the next free track");
+        match self.b.place(seq, kind, index, item) {
+            None => self.report.warn(format!("Resolve {kind:?} track exceeds the {MAX_IMPORTED_TRACKS}-track import limit; clip was skipped")),
+            Some(placed) if placed != index => self.report.info("overlapping clips were moved to the next free track"),
+            Some(_) => {}
         }
     }
 
