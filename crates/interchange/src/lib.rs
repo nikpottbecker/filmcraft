@@ -121,6 +121,30 @@ impl Format {
     }
 }
 
+/// The name of an XML document's root element: the first tag after the declaration, comments,
+/// processing instructions and doctype, looked for in the first MiB only.
+fn xml_root(bytes: &[u8]) -> Option<&str> {
+    let b = bytes.get(..bytes.len().min(1 << 20))?;
+    let mut p = 0;
+    loop {
+        p += b.get(p..)?.iter().position(|&c| c == b'<')?;
+        let rest = b.get(p..)?;
+        let skip_to = |end: &[u8]| rest.windows(end.len()).position(|w| w == end).map(|i| i + end.len());
+        let skip = if rest.starts_with(b"<!--") {
+            skip_to(b"-->")?
+        } else if rest.starts_with(b"<?") {
+            skip_to(b"?>")?
+        } else if rest.starts_with(b"<!") {
+            skip_to(b">")?
+        } else {
+            let name = rest.get(1..)?;
+            let n = name.iter().position(|&c| c.is_ascii_whitespace() || c == b'>' || c == b'/').unwrap_or(name.len());
+            return std::str::from_utf8(name.get(..n)?).ok().filter(|s| !s.is_empty());
+        };
+        p = p.checked_add(skip)?;
+    }
+}
+
 /// Sniff the format of a document from its bytes, using the file extension as a hint.
 pub fn detect(bytes: &[u8], extension: Option<&str>) -> Option<Format> {
     if aaf::sniff(bytes) {
@@ -143,7 +167,7 @@ pub fn detect(bytes: &[u8], extension: Option<&str>) -> Option<Format> {
         }
         // a loose document from a Resolve project archive (`project.xml`, `MpFolder.xml`, a
         // `SeqContainer`): Resolve's database class names as the root element
-        if ["<SM_Project", "<Sm2MpFolder", "<Sm2SequenceContainer"].iter().any(|t| head.contains(t)) {
+        if xml_root(bytes).is_some_and(|r| matches!(r, "SM_Project" | "Sm2MpFolder" | "Sm2SequenceContainer")) {
             return Some(Format::Drp);
         }
         return extension.and_then(Format::from_extension).filter(|f| matches!(f, Format::Fcp7Xml | Format::Fcpxml));
