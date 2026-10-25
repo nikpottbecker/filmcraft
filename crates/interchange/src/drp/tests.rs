@@ -450,3 +450,28 @@ fn overlapping_clips_beyond_the_track_limit_are_skipped() {
     assert!(placed < 300 && placed > 0, "{placed}");
     assert!(report.mentions("track import limit"), "{report}");
 }
+
+#[test]
+fn deeply_nested_compound_clips_stop_at_the_limit() {
+    // a chain of distinct compound clips, each holding the next: without a depth limit the walk
+    // recurses once per level and overflows the stack (an abort, not a catchable panic)
+    const LEVELS: usize = 5000;
+    let r30 = format!("{}0000000000000000", build::f64_le(30.0));
+    let mut pool = String::new();
+    let mut seqs = String::new();
+    let mut tracks = String::new();
+    for i in 0..LEVELS {
+        pool.push_str(&format!(r#"<Sm2MpCompoundClip DbId="cc{i}"><Name>C{i}</Name><MpFolder>m</MpFolder><Sequence>s{i}</Sequence></Sm2MpCompoundClip>"#));
+        seqs.push_str(&format!(r#"<Sm2Sequence DbId="s{i}"><FrameRate>{r30}</FrameRate></Sm2Sequence>"#));
+        let next = i + 1;
+        tracks.push_str(&format!(
+            r#"<Element><Sm2TiTrack DbId="t{i}"><Sequence>s{i}</Sequence><Items><Element><Sm2TiVideoClip DbId="c{i}"><Name>C{next}</Name><Start>0</Start><Duration>30</Duration><In>0</In><MediaRef>cc{next}</MediaRef></Sm2TiVideoClip></Element></Items></Sm2TiTrack></Element>"#
+        ));
+    }
+    let doc = format!(
+        r#"<Doc><Sm2MpFolder DbId="m"><Name>Master</Name></Sm2MpFolder>{pool}<Sm2MpTimelineClip DbId="tc"><Name>Main</Name><MpFolder>m</MpFolder><TimelineSharedHandle><Sm2Timeline DbId="tl"><Name>Main</Name><Sequence>s0</Sequence></Sm2Timeline></TimelineSharedHandle></Sm2MpTimelineClip>{seqs}<Sm2SequenceContainer><VideoTrackVec>{tracks}</VideoTrackVec><AudioTrackVec/></Sm2SequenceContainer></Doc>"#
+    );
+    let (imp, report) = import(doc.as_bytes(), Format::Drp, None).unwrap();
+    assert!(report.mentions("compound clips deep"), "{report}");
+    assert!(!imp.sequences.is_empty());
+}

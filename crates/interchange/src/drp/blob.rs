@@ -24,6 +24,10 @@ use std::io::Read as _;
 const MAX_BLOB: usize = 64 << 20;
 /// Deepest protobuf nesting we walk.
 const MAX_DEPTH: usize = 16;
+/// Most fields we collect from one message (real ones hold a few hundred).
+const MAX_FIELDS: usize = 1 << 18;
+/// UTF-16 bytes we try to decode in one blob, accepted or not (rich-text blobs are a few KiB).
+const MAX_UTF16_WORK: usize = 8 << 20;
 
 /// Decode a hex string (whitespace ignored). `None` when it is not hex.
 pub(crate) fn hex(s: &str) -> Option<Vec<u8>> {
@@ -168,6 +172,9 @@ pub(crate) fn fields(b: &[u8]) -> Option<Vec<(u64, Field<'_>)>> {
             }
             _ => return None,
         };
+        if out.len() >= MAX_FIELDS {
+            return None;
+        }
         out.push((num, f));
     }
     Some(out)
@@ -272,9 +279,13 @@ pub(crate) struct TitleText {
 fn utf16_strings(d: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut p = 0;
+    // charged for every candidate before it is decoded, so rejected ones are bounded too
+    let mut budget = MAX_UTF16_WORK;
     while p + 6 <= d.len() && out.len() < 10_000 {
         let n = d.get(p..p + 4).and_then(|s| s.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0) as usize;
         if (6..=0x10000).contains(&n) && n.is_multiple_of(2) && p + n <= d.len() {
+            let Some(left) = budget.checked_sub(n) else { break };
+            budget = left;
             let units: Vec<u16> = d[p + 4..p + n].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
             if let Ok(s) = String::from_utf16(&units)
                 && !s.is_empty()
@@ -468,6 +479,20 @@ pub(crate) mod build {
         out
     }
 
+    /// A Zstandard (`0x81`) framed blob holding `payload` (under 256 bytes) as one raw block
+    /// (RFC 8878: single-segment frame, 1-byte content size, last raw block).
+    pub fn zstd_framed(payload: &[u8]) -> Vec<u8> {
+        let n = u8::try_from(payload.len()).unwrap();
+        let block = (1u32 | (u32::from(n) << 3)).to_le_bytes();
+        let mut z = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, n, block[0], block[1], block[2]];
+        z.extend_from_slice(payload);
+        let mut out = 2u32.to_be_bytes().to_vec();
+        out.extend_from_slice(&((z.len() + 1) as u32).to_be_bytes());
+        out.push(0x81);
+        out.extend_from_slice(&z);
+        out
+    }
+
     /// `EffectFiltersBA` with `(effect id, [(param id, value)])`.
     pub fn effects(list: &[(u64, &[(u64, f64)])]) -> String {
         let mut top = Vec::new();
@@ -578,11 +603,35 @@ mod tests {
 
     #[test]
     fn real_blobs() {
-        // From a Resolve 20 project: a raw transform blob and a Zstandard-compressed clip info.
+        // From a Resolve 20 project: a raw (`0x80`) video-fade blob.
         let e = effect_params("000000020000001d800a1a08481806380c4a004a10088a011a0b0a09110000000000405140");
         assert_eq!(e.get(&params::VIDEO_FADE).and_then(|p| p.get(&params::VIDEO_FADE_OUT)), Some(&69.0));
         assert!(effect_params("").is_empty());
         assert!(effect_params("zz").is_empty());
+    }
+
+    #[test]
+    fn zstd_blob() {
+        let mut p = Vec::new();
+        build::bytes_field(1, b"/a", &mut p);
+        build::bytes_field(2, b"b.mov", &mut p);
+        assert_eq!(clip_path(&build::hex(&build::zstd_framed(&p))).as_deref(), Some("/a/b.mov"));
+    }
+
+    #[test]
+    fn many_tiny_fields_are_refused() {
+        // `0x12 0x00` (an empty field 2) over and over: 2 input bytes per ~32-byte entry
+        let b = [0x12u8, 0x00].repeat(MAX_FIELDS + 1);
+        assert!(fields(&b).is_none());
+        assert_eq!(fields(&[0x12, 0x00]).map(|f| f.len()), Some(1));
+    }
+
+    #[test]
+    fn rejected_utf16_candidates_are_bounded() {
+        // every 4th offset claims a 64 KiB string that is valid UTF-16 but holds NULs, so it is
+        // decoded and then rejected: without a work budget this is ~10¹¹ steps on 64 MiB
+        let d = [0xfeu8, 0xff, 0x00, 0x00].repeat(4 << 20);
+        assert!(utf16_strings(&d).is_empty());
     }
 
     #[test]
@@ -620,6 +669,12 @@ mod tests {
             build::clip("/a", "b.mov"),
             build::fusion("Hello", "Open Sans"),
             build::angle("Camera 1"),
+            {
+                let mut p = Vec::new();
+                build::bytes_field(1, b"/a", &mut p);
+                build::bytes_field(2, b"b.mov", &mut p);
+                build::hex(&build::zstd_framed(&p))
+            },
         ];
         for seed in seeds {
             let b = hex(&seed).unwrap();

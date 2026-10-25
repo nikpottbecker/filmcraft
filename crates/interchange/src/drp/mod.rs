@@ -18,14 +18,17 @@
 //! | Video / audio tracks, their names | tracks |
 //! | Video and audio clips: position, duration, source in (sub-frame exact) | clips (video and audio of one take linked) |
 //! | Text titles (rich text) | graphic clips with a text layer: text, first run's font, style and colour |
+//! | Fusion Text+ titles | graphic clips with a text layer: text, font, size and colour |
 //! | Inspector ▸ Transform: zoom, position, rotation | Motion: scale (width), position, rotation |
 //! | Inspector ▸ Volume | Volume level |
 //! | Fade handles (video and audio) | Cross Dissolve / Constant Power from or to nothing |
 //! | Cross Dissolve, Cross Fade ±3 dB / 0 dB and other transitions | the matching transition, else Cross Dissolve / Constant Power (reported) |
+//! | Compound clips | nested sequences (one inside itself, or nested deeper than `MAX_NESTING`, is a gap) |
+//! | Multicam clips | flattened to the active angle's media |
 //!
 //! Not imported, and reported: colour grades (each graded clip is counted), Fusion compositions,
-//! other effects and generators (a generator without text becomes Transparent Video), compound,
-//! multicam and other special clips (a gap), retiming, keyframes and markers.
+//! other effects and generators (a generator without text becomes Transparent Video), other
+//! special clips (a gap), retiming, keyframes and markers.
 //!
 //! Resolve's `Start` is the timeline frame (counting from the timeline's start timecode, normally
 //! 01:00:00:00); `In` is the source offset expressed in *timeline* frames, which is why media at
@@ -60,6 +63,8 @@ pub fn sniff(bytes: &[u8]) -> bool {
 const MAX_SECONDS: i64 = 1_000_000;
 /// Most media pool clips / timeline items we read.
 const MAX_OBJECTS: usize = 1_000_000;
+/// Deepest compound-clip nesting we follow (real projects nest a handful).
+const MAX_NESTING: usize = 64;
 
 // ---------------------------------------------------------------------------------------------
 // Document model (owned, read from the XML)
@@ -73,6 +78,29 @@ struct Doc {
     timelines: Vec<TimelineDoc>,
     sequences: HashMap<String, SeqDoc>,
     tracks: Vec<TrackDoc>,
+    /// Pool item id → index in `pool`, and sequence id → indices in `tracks` (see [`Doc::index`]).
+    pool_ids: HashMap<String, usize>,
+    seq_tracks: HashMap<String, Vec<usize>>,
+}
+
+impl Doc {
+    /// Build the id lookups, once everything is read (a project can hold many thousands of each).
+    fn index(&mut self) {
+        for (i, p) in self.pool.iter().enumerate() {
+            self.pool_ids.entry(p.id.clone()).or_insert(i);
+        }
+        for (i, t) in self.tracks.iter().enumerate() {
+            self.seq_tracks.entry(t.sequence.clone()).or_default().push(i);
+        }
+    }
+
+    fn pool_item(&self, id: &str) -> Option<&PoolItem> {
+        self.pool.get(*self.pool_ids.get(id)?)
+    }
+
+    fn tracks_of<'d>(&'d self, seq_id: &str) -> impl Iterator<Item = &'d TrackDoc> {
+        self.seq_tracks.get(seq_id).into_iter().flatten().filter_map(|&i| self.tracks.get(i))
+    }
 }
 
 struct Folder {
@@ -329,6 +357,7 @@ pub fn import(bytes: &[u8], opts: &ImportOptions) -> Result<(Imported, Report)> 
     if doc.timelines.is_empty() && doc.tracks.is_empty() && doc.pool.is_empty() {
         return Err(Error::Empty);
     }
+    doc.index();
     let name = doc.project_name.clone().or_else(|| opts.name.clone()).unwrap_or_else(|| "DaVinci Resolve Project".into());
     let mut imp = Imp {
         b: Builder::new(&name),
@@ -507,9 +536,14 @@ impl Imp<'_, '_> {
         if let Some(id) = self.seq_items.get(seq_id) {
             return Some(*id);
         }
+        // each level is a few stack frames (timeline → build_sequence → timeline_clip)
+        if self.building.len() >= MAX_NESTING {
+            self.report.warn(format!("\"{name}\" is nested more than {MAX_NESTING} compound clips deep; the inner use was left as a gap"));
+            return None;
+        }
         self.building.insert(seq_id.to_string());
         let info = doc.sequences.get(seq_id).cloned().unwrap_or_default();
-        let tracks: Vec<&TrackDoc> = doc.tracks.iter().filter(|t| t.sequence == seq_id).collect();
+        let tracks: Vec<&TrackDoc> = doc.tracks_of(seq_id).collect();
         let r = self.build_sequence(doc, seq_id, name, &info, &tracks, bin, parent_rate);
         self.building.remove(seq_id);
         r
@@ -672,7 +706,7 @@ impl Imp<'_, '_> {
         size: (u32, u32),
         rate: FrameRate,
     ) -> Option<TrackItem> {
-        let pool = it.media_ref.as_ref().and_then(|r| doc.pool.iter().find(|p| &p.id == r));
+        let pool = it.media_ref.as_deref().and_then(|r| doc.pool_item(r));
         if let Some(p) = pool
             && let Some(seq_id) = &p.sequence
         {
@@ -719,7 +753,7 @@ impl Imp<'_, '_> {
         let inner_fps = info.rate.map(rate_from_f64).unwrap_or(rate).as_f64();
         let fps = rate.as_f64();
         let inner_start = info.start_seconds.filter(|s| (0.0..MAX_SECONDS as f64).contains(s)).unwrap_or(0.0);
-        let mut angles: Vec<&TrackDoc> = doc.tracks.iter().filter(|t| t.sequence == seq_id && t.kind == kind).collect();
+        let mut angles: Vec<&TrackDoc> = doc.tracks_of(seq_id).filter(|t| t.kind == kind).collect();
         angles.sort_by_key(|t| t.index);
         if angles.is_empty() {
             self.report.warn(format!("multicam clip \"{}\" has no angles and was skipped", it.name));
