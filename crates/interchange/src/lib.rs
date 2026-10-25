@@ -141,6 +141,11 @@ pub fn detect(bytes: &[u8], extension: Option<&str>) -> Option<Format> {
         if head.contains("<fcpxml") {
             return Some(Format::Fcpxml);
         }
+        // a loose document from a Resolve project archive (`project.xml`, `MpFolder.xml`, a
+        // `SeqContainer`): Resolve's database class names as the root element
+        if ["<SM_Project", "<Sm2MpFolder", "<Sm2SequenceContainer"].iter().any(|t| head.contains(t)) {
+            return Some(Format::Drp);
+        }
         return extension.and_then(Format::from_extension).filter(|f| matches!(f, Format::Fcp7Xml | Format::Fcpxml));
     }
     if head.starts_with('{') {

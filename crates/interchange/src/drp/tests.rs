@@ -279,6 +279,10 @@ fn imports_a_timeline() {
 
 #[test]
 fn imports_a_lone_timeline_document() {
+    // detected as Resolve, not FCP7 XML, from a `.xml` file name
+    assert_eq!(crate::detect(seq_container_xml().as_bytes(), Some("xml")), Some(Format::Drp));
+    assert_eq!(crate::detect(media_pool_xml().as_bytes(), Some("xml")), Some(Format::Drp));
+    assert_eq!(crate::detect(project_xml().as_bytes(), None), Some(Format::Drp));
     let (imp, _) = import_with(seq_container_xml().as_bytes(), Format::Drp, &ImportOptions { name: Some("Loose".into()), ..Default::default() }).unwrap();
     assert_eq!(imp.project.name, "Loose");
     assert_eq!(imp.sequences.len(), 1);
